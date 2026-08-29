@@ -40,7 +40,7 @@ export interface ResolvedEndpoint {
 }
 
 const IDENTIFIER = /^[A-Za-z0-9_-]{1,256}$/;
-const CURSOR = /^[A-Za-z0-9._~-]{1,512}$/;
+const CURSOR = /^[A-Za-z0-9+/=._~:-]{1,4096}$/;
 const MAX_PAGE_SIZE = 100;
 const MAX_BATCH_SIZE = 10;
 

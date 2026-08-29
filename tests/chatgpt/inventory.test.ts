@@ -116,6 +116,33 @@ describe("ChatGPT complete inventory", () => {
     }
   });
 
+  it("accepts long base64 project cursors and treats an empty-string cursor as termination", async () => {
+    const filesystem = new MemoryArchiveFileSystem();
+    const longCursor = `${"A".repeat(540)}+/=:`;
+    const requestedCursors: Array<string | null> = [];
+    const transport = scriptedTransport((operation) => {
+      if (operation.operation === "conversation_page") return page([], 0, operation.parameters.offset);
+      if (operation.operation === "shared_page") return { items: [], total: 0 };
+      if (operation.operation === "project_conversation_page") return { items: [], cursor: null };
+      if (operation.operation === "project_page") {
+        requestedCursors.push(operation.parameters.cursor);
+        if (operation.parameters.cursor === null) return { items: [{ gizmo: { gizmo: { id: "project-1" } } }], cursor: longCursor };
+        return { items: [{ gizmo: { gizmo: { id: "project-2" } } }], cursor: "" };
+      }
+      throw new Error(`Unexpected ${operation.operation}`);
+    });
+    const inventory = await new ChatGptInventoryEngine({
+      transport,
+      filesystem,
+      workspace,
+      settings: DEFAULT_INVENTORY_SETTINGS,
+      now: () => new Date("2026-08-01T00:00:00.000Z"),
+    }).run();
+    expect(inventory.complete).toBe(true);
+    expect(requestedCursors).toEqual([null, longCursor]);
+    expect((inventory.projects ?? []).map((project) => project.projectId)).toEqual(["project-1", "project-2"]);
+  });
+
   it("fails closed when project cursors cycle or claim continuation after an empty page", async () => {
     for (const nextCursor of ["cursor-1", "cursor-2"] as const) {
       let projectCalls = 0;
