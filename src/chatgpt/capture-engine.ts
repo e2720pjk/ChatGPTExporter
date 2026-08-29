@@ -62,6 +62,7 @@ export interface ConversationCaptureProgress {
 
 export class ChatGptCaptureEngine {
   private readonly now: () => Date;
+  private runResult: CaptureRunResult | undefined;
 
   constructor(private readonly options: {
     transport: ChatGptTransport;
@@ -95,6 +96,7 @@ export class ChatGptCaptureEngine {
       projectAssetStatus: this.options.includeAssets === false ? "not_requested" : "complete",
       accountArtifactStatus: "not_requested",
     };
+    this.runResult = result;
     if (this.options.includeAccountArtifacts !== false) {
       result.accountArtifactStatus = (await new AccountArtifactCapture({
         transport: this.options.transport,
@@ -218,7 +220,7 @@ export class ChatGptCaptureEngine {
     alreadyWriting = false,
   ): Promise<"complete" | "partial" | "not_requested"> {
     if (!alreadyWriting) await store.transition(conversation, "writing", { attempt: 1, correlationId, rawHash: rawMarker.detailHash });
-    this.options.onProgress?.({ phase: "writing", completed: 0, total: 0, conversationId: conversation.conversationId });
+    if (this.runResult) this.progress("writing", this.runResult, conversation.conversationId);
     const normalized = normalizeConversation(detail, conversation, this.options.workspace.workspaceFingerprint);
     if (normalized.findings.some((finding) => finding.severity === "error")) throw new Error(`Normalization produced graph errors for ${conversation.conversationId}.`);
     const assets = this.options.includeAssets === false

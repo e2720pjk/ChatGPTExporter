@@ -63,3 +63,7 @@ code { color: #c8d2ca; }
   .controls-panel { grid-template-columns: 1fr; }
   fieldset { flex-wrap: wrap; }
 }
+
+#capture-progress { width: 100%; height: 10px; margin-bottom: 10px; appearance: none; border: 1px solid var(--line); background: transparent; }
+#capture-progress::-webkit-progress-bar { background: rgba(18, 22, 19, .88); }
+#capture-progress::-webkit-progress-value { background: var(--accent); transition: width .3s ease; }

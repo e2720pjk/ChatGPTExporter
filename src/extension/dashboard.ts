@@ -31,6 +31,7 @@ const inventorySummary = element<HTMLElement>("inventory-summary");
 const directoryLabel = element<HTMLElement>("directory-label");
 const status = element<HTMLElement>("status");
 const log = element<HTMLElement>("log");
+const captureProgress = element<HTMLProgressElement>("capture-progress");
 
 let directoryHandle: FileSystemDirectoryHandle | undefined;
 let client: ChatGptClient | undefined;
@@ -300,7 +301,13 @@ async function runCapture(): Promise<void> {
         includeAssets: assetScope.checked,
         includeAccountArtifacts: accountScope.checked,
         onProgress: (progress) => {
-          setStatus(`Capturing ${workspace.workspaceFingerprint.slice(0, 8)}…: ${progress.completed}/${progress.total} complete (${progress.phase})…`, "busy");
+          if (progress.total > 0) {
+            captureProgress.hidden = false;
+            captureProgress.max = progress.total;
+            captureProgress.value = progress.completed;
+          }
+          const phase = progress.phase === "writing" ? "downloading assets & writing" : progress.phase === "complete" ? "captured" : progress.phase;
+          setStatus(`Capturing ${workspace.workspaceFingerprint.slice(0, 8)}…: ${progress.completed}/${progress.total} conversations (${phase})…`, "busy");
         },
       }).run();
       captured += result.capturedCount;
@@ -319,6 +326,7 @@ async function runCapture(): Promise<void> {
   } finally {
     activeController = undefined;
     setRunControls(false);
+    captureProgress.hidden = true;
     captureButton.disabled = false;
     inventoryButton.disabled = false;
     chooseButton.disabled = false;
