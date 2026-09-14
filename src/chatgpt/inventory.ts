@@ -431,8 +431,14 @@ function nullableTotal(value: JsonValue | undefined, name: string): number | nul
 }
 
 function optionalCursor(value: JsonValue | undefined, name: string): string | null {
-  if (value === null || value === undefined) return null;
-  if (typeof value !== "string" || !/^[A-Za-z0-9._~-]{1,512}$/.test(value)) throw new InventoryError("INVALID_INVENTORY_ENVELOPE", `${name} is invalid.`);
+  if (value === null || value === undefined || value === "") return null;
+  if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) return String(value);
+  if (typeof value !== "string" || !/^[A-Za-z0-9+/=._~:-]{1,4096}$/.test(value)) {
+    const detail = typeof value === "string"
+      ? `string length ${value.length}, unexpected characters ${JSON.stringify([...new Set(value.replace(/[A-Za-z0-9+/=._~:-]/g, ""))].join("")).slice(0, 40)}`
+      : typeof value;
+    throw new InventoryError("INVALID_INVENTORY_ENVELOPE", `${name} is invalid (${detail}).`);
+  }
   return value;
 }
 

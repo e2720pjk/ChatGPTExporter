@@ -28,6 +28,12 @@ describe("ChatGPT endpoint allowlist", () => {
       operation: "conversation_batch",
       parameters: { conversationIds: Array.from({ length: 11 }, (_, index) => `conversation-${index}`) },
     })).toThrow("1-10");
+    expect(resolveEndpoint({ operation: "project_page", parameters: { cursor: "eyJvZmZzZXQiOjIwfQ==" } }).path)
+      .toBe(`/backend-api/gizmos/snorlax/sidebar?conversations_per_gizmo=0&cursor=${encodeURIComponent("eyJvZmZzZXQiOjIwfQ==")}`);
+    expect(() => resolveEndpoint({
+      operation: "project_page",
+      parameters: { cursor: "cursor with spaces" },
+    })).toThrow(EndpointValidationError);
   });
 
   it("constructs shared, account-artifact, and file descriptor adapters without arbitrary URLs", () => {
