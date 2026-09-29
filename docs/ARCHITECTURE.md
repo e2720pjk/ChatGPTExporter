@@ -16,7 +16,7 @@ The public extension manifest requests no named browser permissions and only the
 
 Inventory is authoritative for the current expected set. Main and archived history use independent offset chains; the project index and every project conversation list use cursor chains; shared history is independently enumerated. Raw response pages are written before their IDs enter the union. Repeated pages/cursors, premature empty pages, byte/page limits, malformed envelopes, and inconclusive termination fail closed.
 
-Conversation capture reconciles batches of at most ten IDs. Missing, duplicate, malformed, or suspicious graphs fall back to individual detail retrieval; share-only records use the share adapter. Raw listing, batch, and detail revisions are content-addressed before a raw completion marker is written.
+Conversation capture reconciles batches of at most ten IDs. Missing, duplicate, malformed, or suspicious graphs fall back to individual detail retrieval; share-only records use the share adapter. Raw listing, batch, and detail revisions are content-addressed before a raw completion marker is written. Each batch response is stored once under `source/batches/` and referenced by every conversation captured from that response; legacy per-conversation batch paths remain readable.
 
 Normalization retains every node/message and provider extension. Deterministic normalized JSON, selected-first branch-aware Markdown, assets, and metadata are written before the final completion marker. A rerun verifies hashes before skipping; damaged derived files rebuild from valid raw bytes without a detail request.
 
@@ -44,6 +44,7 @@ ChatGPTExport-<workspace-fingerprint>/
   inventory.json
   source/inventory/
   source/account/
+  source/batches/batch-<sha256>.json
   conversations/<conversation-id>/
     source/
     raw-complete.json

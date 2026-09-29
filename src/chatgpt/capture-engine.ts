@@ -1,4 +1,4 @@
-import { CaptureStore, type RawCompletionMarker } from "../core/capture-store";
+import { CaptureStore, type RawCompletionMarker, type RawRevision } from "../core/capture-store";
 import type { ArchiveFileSystem } from "../core/filesystem";
 import { sha256Hex } from "../core/hash";
 import { renderConversationMarkdown } from "../core/markdown";
@@ -135,8 +135,11 @@ export class ChatGptCaptureEngine {
       try {
         await new ChatGptDetailFetcher(this.options.transport, this.options.workspace, this.options.batchSize ?? 10).fetchAll(needNetwork, async (checkpoint) => {
           const batchByConversation = mapBatches(checkpoint.batches);
+          const batchRevisions = new Map<RawBatchCapture, RawRevision>();
+          for (const batch of checkpoint.batches) batchRevisions.set(batch, await store.writeRawBatchRevision(batch.response));
           for (const retrieved of checkpoint.conversations) {
-            const assetStatus = await this.persistAndDerive(store, assetManager, retrieved, batchByConversation.get(retrieved.inventory.conversationId));
+            const batch = batchByConversation.get(retrieved.inventory.conversationId);
+            const assetStatus = await this.persistAndDerive(store, assetManager, retrieved, batch ? batchRevisions.get(batch) : undefined);
             if (assetStatus === "partial") result.partialAssetCount += 1;
             result.capturedCount += 1;
             completedThisRun.add(retrieved.inventory.logicalKey);
@@ -182,11 +185,10 @@ export class ChatGptCaptureEngine {
     return result;
   }
 
-  private async persistAndDerive(store: CaptureStore, assetManager: ChatGptAssetManager, retrieved: RetrievedConversationDetail, batch: RawBatchCapture | undefined): Promise<"complete" | "partial" | "not_requested"> {
+  private async persistAndDerive(store: CaptureStore, assetManager: ChatGptAssetManager, retrieved: RetrievedConversationDetail, batchRevision: RawRevision | undefined): Promise<"complete" | "partial" | "not_requested"> {
     const conversation = retrieved.inventory;
     for (const listing of conversation.listingRecords ?? []) await store.writeRawRevision(conversation.conversationId, "listing", listing);
     const detailRevision = await store.writeRawRevision(conversation.conversationId, "detail", retrieved.raw);
-    const batchRevision = batch === undefined ? undefined : await store.writeRawRevision(conversation.conversationId, "batch", batch.response);
     await store.transition(conversation, "writing", {
       attempt: 1,
       correlationId: retrieved.correlationId,

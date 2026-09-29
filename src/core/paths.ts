@@ -1,5 +1,6 @@
 // Adapted from GrokExporter commit 85922d6.
 const WINDOWS_RESERVED = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i;
+const SHA256_HEX = /^[a-f0-9]{64}$/;
 
 export function safePathSegment(value: string, fallback = "untitled", maxLength = 120): string {
   const normalized = value.normalize("NFKC")
@@ -24,6 +25,22 @@ export function conversationBasePath(conversationId: string): string {
   const path = `conversations/${safePathSegment(conversationId, "missing-id", 160)}`;
   assertSafeRelativePath(path);
   return path;
+}
+
+export function rawDetailRevisionPath(conversationId: string, hash: string): string {
+  if (!SHA256_HEX.test(hash)) throw new Error("Raw detail hash is invalid.");
+  return `${conversationBasePath(conversationId)}/source/detail-${hash}.json`;
+}
+
+export function batchRevisionPath(hash: string): string {
+  if (!SHA256_HEX.test(hash)) throw new Error("Raw batch hash is invalid.");
+  return `source/batches/batch-${hash}.json`;
+}
+
+export function isBatchRevisionPath(path: string, conversationId: string, hash: string): boolean {
+  if (!SHA256_HEX.test(hash)) return false;
+  return path === batchRevisionPath(hash)
+    || path === `${conversationBasePath(conversationId)}/source/batch-${hash}.json`;
 }
 
 export function extensionFromMediaType(mediaType: string | null, bytes?: Uint8Array): string {
