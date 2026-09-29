@@ -16,6 +16,16 @@ This is an independent community project and is not affiliated with or endorsed 
 - Memories, custom instructions, settings, beta-feature settings, and sanitized workspace/session metadata as auxiliary account artifacts.
 - Previous local conversations that disappear from a later remote inventory, marked absent rather than deleted.
 
+## Fork changes from upstream
+
+Compared with upstream `v0.1.6` (`c5618b3`), this fork includes changes from three branches:
+
+- **`feat/capture-progress`** (`0c9d35d`): replaces the misleading `0/0` status during the slow asset-writing phase with live conversation counts and a progress bar.
+- **`fix/project-pagination-cursors`** (`f220122`): accepts real project pagination cursors that exceeded the old length/character limits, treats an empty cursor as normal termination, and keeps invalid-cursor errors from exposing cursor contents.
+- **`fix/shared-raw-batch-storage`** (`980bdf4`): stores each raw batch response once instead of copying it into every conversation that came back in that batch. The branch also restores the parent-directory picker so users can confirm or change the archive location (`1969b26`).
+
+**Current archive-storage direction:** one batch response may contain several conversations, so duplicating its raw payload per conversation wastes space. New captures store it once at `source/batches/batch-<sha256>.json`; conversation markers reference that shared, hash-verified evidence. Normalized conversation files and asset storage are unchanged. Resume and audit still accept legacy per-conversation batch paths, so existing archives do not need migration.
+
 ## Install from source
 
 Requirements are Node.js 20+ and a Chromium browser that supports Manifest V3 and the File System Access API.
