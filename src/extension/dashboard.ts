@@ -86,10 +86,6 @@ async function chooseDirectory(): Promise<void> {
     return;
   }
   try {
-    if (directoryHandle && await ensureDirectoryPermission(directoryHandle, true)) {
-      enableSelectedDirectory(directoryHandle);
-      return;
-    }
     const selectedHandle = await window.showDirectoryPicker({ id: "chatgpt-exporter-parent", mode: "readwrite" });
     directoryHandle = selectedHandle;
     await saveDirectoryHandle(selectedHandle);

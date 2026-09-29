@@ -2,7 +2,7 @@ import type { ConversationCompletionMarker } from "./capture-engine";
 import type { RawCompletionMarker } from "../core/capture-store";
 import type { ArchiveFileSystem } from "../core/filesystem";
 import { sha256Hex } from "../core/hash";
-import { conversationBasePath } from "../core/paths";
+import { conversationBasePath, isBatchRevisionPath, rawDetailRevisionPath } from "../core/paths";
 import { IncrementalSha256 } from "../core/sha256-stream";
 import { parseJson, prettyJson } from "../core/serialization";
 import type {
@@ -260,6 +260,21 @@ async function verifyRawGraph(
   normalized: NormalizedConversation,
   findings: ArchiveAuditFinding[],
 ): Promise<void> {
+  if (rawMarker.schemaVersion !== 1
+    || rawMarker.provider !== "chatgpt-web"
+    || rawMarker.logicalKey !== normalized.logicalKey
+    || rawMarker.conversationId !== normalized.conversationId
+    || rawMarker.workspaceFingerprint !== normalized.workspaceFingerprint) {
+    findings.push(error("RAW_MARKER_IDENTITY", "Raw marker identity does not match its normalized conversation."));
+    return;
+  }
+  if (typeof rawMarker.detailHash !== "string"
+    || !/^[a-f0-9]{64}$/.test(rawMarker.detailHash)
+    || rawMarker.detailPath !== rawDetailRevisionPath(rawMarker.conversationId, rawMarker.detailHash)) {
+    findings.push(error("RAW_DETAIL_PATH_INVALID", "Raw detail path is not the expected in-archive revision path.", rawMarker.detailPath));
+    return;
+  }
+  await verifyRawBatch(filesystem, rawMarker, findings);
   const rawText = await filesystem.readText(rawMarker.detailPath);
   if (rawText === undefined || await sha256Hex(rawText) !== rawMarker.detailHash) {
     findings.push(error("RAW_DETAIL_HASH_MISMATCH", "Raw conversation detail is missing or does not match its marker.", rawMarker.detailPath));
@@ -276,6 +291,23 @@ async function verifyRawGraph(
   const rawMessageIds = Object.values(raw.mapping).flatMap((node) => typeof node?.message?.id === "string" ? [node.message.id] : []).sort();
   const normalizedMessageIds = normalized.messages.map((message) => message.id).sort();
   if (!sameSet(rawMessageIds, normalizedMessageIds)) findings.push(error("GRAPH_MESSAGE_SET_MISMATCH", "Raw and normalized message sets differ.", rawMarker.detailPath));
+}
+
+async function verifyRawBatch(filesystem: ArchiveFileSystem, rawMarker: RawCompletionMarker, findings: ArchiveAuditFinding[]): Promise<void> {
+  if (rawMarker.batchHash == null && rawMarker.batchPath == null) {
+    if (rawMarker.retrievalSource === "batch") findings.push(error("RAW_BATCH_MARKER_MISSING", "Batch-retrieved conversation has no batch evidence reference."));
+    return;
+  }
+  if (typeof rawMarker.batchHash !== "string"
+    || typeof rawMarker.batchPath !== "string"
+    || !isBatchRevisionPath(rawMarker.batchPath, rawMarker.conversationId, rawMarker.batchHash)) {
+    findings.push(error("RAW_BATCH_PATH_INVALID", "Raw batch path is not a recognized in-archive revision path.", rawMarker.batchPath ?? undefined));
+    return;
+  }
+  const batchText = await filesystem.readText(rawMarker.batchPath);
+  if (batchText === undefined || await sha256Hex(batchText) !== rawMarker.batchHash) {
+    findings.push(error("RAW_BATCH_HASH_MISMATCH", "Raw batch evidence is missing or does not match its marker.", rawMarker.batchPath));
+  }
 }
 
 async function verifyAssets(filesystem: ArchiveFileSystem, assets: AssetRecord[], findings: ArchiveAuditFinding[]): Promise<void> {

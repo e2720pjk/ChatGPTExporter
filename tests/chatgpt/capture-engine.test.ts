@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 
+import type { RawCompletionMarker } from "../../src/core/capture-store";
 import { MemoryArchiveFileSystem } from "../../src/core/filesystem";
 import { prettyJson } from "../../src/core/serialization";
 import type { ConversationInventory, JsonValue } from "../../src/core/types";
@@ -33,9 +34,47 @@ describe("journaled ChatGPT capture engine", () => {
       "runs/run-1.json",
     ]));
     expect(paths.some((path) => path.includes("/source/detail-"))).toBe(true);
-    expect(paths.some((path) => path.includes("/source/batch-"))).toBe(true);
+    expect(paths.some((path) => path.startsWith("source/batches/batch-"))).toBe(true);
     const journal = JSON.parse((await filesystem.readText("runs/run-1.json"))!);
     expect(journal.entries.map((entry: { to: string }) => entry.to)).toEqual(["pending", "capturing", "writing", "complete"]);
+  });
+
+  it("stores one shared batch blob for all conversations returned by that batch", async () => {
+    const filesystem = await fixtureFilesystem();
+    const inventory = JSON.parse((await filesystem.readText("inventory.json"))!) as ConversationInventory;
+    inventory.conversations.push({
+      ...inventory.conversations[0]!,
+      logicalKey: `${workspace.workspaceFingerprint}/conversation-2`,
+      conversationId: "conversation-2",
+      listingHashes: ["listing-2"],
+      listingRecords: [{ id: "conversation-2", title: "Synthetic second" }],
+    });
+    inventory.chains[0]!.itemCount = 2;
+    inventory.chains[0]!.uniqueConversationCount = 2;
+    await filesystem.writeTextAtomic("inventory.json", prettyJson(inventory));
+    const body = [
+      conversationDetail() as unknown as JsonValue,
+      conversationDetail({ id: "conversation-2" }) as unknown as JsonValue,
+    ];
+    const request = vi.fn(async (operation: ChatGptOperationParameters): Promise<ApiSuccessResponse> => {
+      if (operation.operation !== "conversation_batch") throw new Error(`unexpected ${operation.operation}`);
+      return { requestId: "request", protocolVersion: BRIDGE_PROTOCOL_VERSION, ok: true, status: 200, body, responseBytes: JSON.stringify(body).length, correlationId: "batch-correlation" };
+    });
+
+    const result = await new ChatGptCaptureEngine({
+      transport: { request }, filesystem, workspace, runId: "run-shared-batch", batchSize: 2,
+      includeAssets: false, includeAccountArtifacts: false, now: clock(),
+    }).run();
+    const markers = await Promise.all(["conversation-1", "conversation-2"].map(async (id) =>
+      JSON.parse((await filesystem.readText(`conversations/${id}/raw-complete.json`))!) as RawCompletionMarker));
+
+    expect(result.capturedCount).toBe(2);
+    expect(request).toHaveBeenCalledTimes(1);
+    expect(markers[0]!.batchHash).toBe(markers[1]!.batchHash);
+    expect(markers[0]!.batchPath).toBe(markers[1]!.batchPath);
+    expect(markers[0]!.batchPath).toMatch(/^source\/batches\/batch-[a-f0-9]{64}\.json$/);
+    expect(filesystem.paths().filter((path) => path.startsWith("source/batches/"))).toHaveLength(1);
+    expect(filesystem.paths().some((path) => path.includes("/source/batch-"))).toBe(false);
   });
 
   it("performs an unchanged repeat without network requests", async () => {

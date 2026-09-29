@@ -1,8 +1,13 @@
 import type { ArchiveFileSystem } from "./filesystem";
 import { sha256Hex } from "./hash";
-import { conversationBasePath, safePathSegment } from "./paths";
+import { batchRevisionPath, conversationBasePath, isBatchRevisionPath, rawDetailRevisionPath, safePathSegment } from "./paths";
 import { parseJson, prettyJson } from "./serialization";
 import type { CaptureJournalEntry, CaptureStage, InventoryConversation, JsonValue, SafeFailure } from "./types";
+
+export interface RawRevision {
+  hash: string;
+  path: string;
+}
 
 export interface RunJournal {
   schemaVersion: 1;
@@ -94,10 +99,22 @@ export class CaptureStore {
     return entry;
   }
 
-  async writeRawRevision(conversationId: string, kind: "listing" | "detail" | "batch", value: JsonValue): Promise<{ hash: string; path: string }> {
+  async writeRawRevision(conversationId: string, kind: "listing" | "detail", value: JsonValue): Promise<RawRevision> {
     const content = prettyJson(value);
     const hash = await sha256Hex(content);
-    const path = `${conversationBasePath(conversationId)}/source/${kind}-${hash}.json`;
+    const path = kind === "detail"
+      ? rawDetailRevisionPath(conversationId, hash)
+      : `${conversationBasePath(conversationId)}/source/listing-${hash}.json`;
+    const existing = await this.filesystem.readText(path);
+    if (existing !== undefined && await sha256Hex(existing) !== hash) throw new Error(`Existing raw revision hash mismatch at ${path}.`);
+    if (existing === undefined) await this.filesystem.writeTextAtomic(path, content);
+    return { hash, path };
+  }
+
+  async writeRawBatchRevision(value: JsonValue): Promise<RawRevision> {
+    const content = prettyJson(value);
+    const hash = await sha256Hex(content);
+    const path = batchRevisionPath(hash);
     const existing = await this.filesystem.readText(path);
     if (existing !== undefined && await sha256Hex(existing) !== hash) throw new Error(`Existing raw revision hash mismatch at ${path}.`);
     if (existing === undefined) await this.filesystem.writeTextAtomic(path, content);
@@ -120,11 +137,17 @@ export class CaptureStore {
       || marker.logicalKey !== conversation.logicalKey
       || marker.conversationId !== conversation.conversationId
       || marker.workspaceFingerprint !== this.workspaceFingerprint
-      || !sameSet(marker.listingHashes, conversation.listingHashes)) return undefined;
+      || !sameSet(marker.listingHashes, conversation.listingHashes)
+      || typeof marker.detailHash !== "string"
+      || !/^[a-f0-9]{64}$/.test(marker.detailHash)
+      || marker.detailPath !== rawDetailRevisionPath(conversation.conversationId, marker.detailHash)) return undefined;
     const detail = await this.filesystem.readText(marker.detailPath);
     if (detail === undefined || await sha256Hex(detail) !== marker.detailHash) return undefined;
-    if ((marker.batchHash === null) !== (marker.batchPath === null)) return undefined;
-    if (marker.batchHash && marker.batchPath) {
+    if ((marker.batchHash == null) !== (marker.batchPath == null)) return undefined;
+    if (marker.batchHash != null) {
+      if (typeof marker.batchHash !== "string"
+        || typeof marker.batchPath !== "string"
+        || !isBatchRevisionPath(marker.batchPath, conversation.conversationId, marker.batchHash)) return undefined;
       const batch = await this.filesystem.readText(marker.batchPath);
       if (batch === undefined || await sha256Hex(batch) !== marker.batchHash) return undefined;
     }

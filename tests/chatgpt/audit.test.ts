@@ -5,6 +5,7 @@ import { ChatGptCaptureEngine } from "../../src/chatgpt/capture-engine";
 import type { ChatGptTransport, DiscoveredWorkspace } from "../../src/chatgpt/client";
 import type { ChatGptOperationParameters } from "../../src/chatgpt/endpoints";
 import { MemoryArchiveFileSystem } from "../../src/core/filesystem";
+import { sha256Hex } from "../../src/core/hash";
 import { prettyJson } from "../../src/core/serialization";
 import type { ConversationInventory, JsonValue } from "../../src/core/types";
 import { BRIDGE_PROTOCOL_VERSION, type ApiSuccessResponse } from "../../src/extension/protocol";
@@ -41,6 +42,36 @@ describe("independent archive audit", () => {
     const report = await auditArchive({ filesystem, extensionVersion: "0.0.0-test" });
     expect(report.terminalState).toBe("incomplete");
     expect(report.findings.some((finding) => finding.code === "DERIVED_HASH_MISMATCH")).toBe(true);
+  });
+
+  it("fails audit when shared batch evidence is missing or corrupt", async () => {
+    const filesystem = await capturedArchive();
+    const rawMarker = JSON.parse((await filesystem.readText("conversations/conversation-1/raw-complete.json"))!);
+    await filesystem.writeTextAtomic(rawMarker.batchPath, "corrupted");
+
+    const report = await auditArchive({ filesystem, extensionVersion: "0.0.0-test" });
+    expect(report.terminalState).toBe("incomplete");
+    expect(report.findings.some((finding) => finding.code === "RAW_BATCH_HASH_MISMATCH")).toBe(true);
+  });
+
+  it("validates legacy per-conversation batch references", async () => {
+    const filesystem = await capturedArchive();
+    const rawMarkerPath = "conversations/conversation-1/raw-complete.json";
+    const rawMarker = JSON.parse((await filesystem.readText(rawMarkerPath))!);
+    const sharedPath = rawMarker.batchPath as string;
+    const legacyPath = `conversations/conversation-1/source/batch-${rawMarker.batchHash}.json`;
+    await filesystem.writeTextAtomic(legacyPath, (await filesystem.readText(sharedPath))!);
+    await filesystem.remove(sharedPath);
+    rawMarker.batchPath = legacyPath;
+    const rawMarkerText = prettyJson(rawMarker);
+    await filesystem.writeTextAtomic(rawMarkerPath, rawMarkerText);
+    const completionPath = "conversations/conversation-1/complete.json";
+    const completion = JSON.parse((await filesystem.readText(completionPath))!);
+    completion.rawMarkerHash = await sha256Hex(rawMarkerText);
+    await filesystem.writeTextAtomic(completionPath, prettyJson(completion));
+
+    const report = await auditArchive({ filesystem, extensionVersion: "0.0.0-test" });
+    expect(report.terminalState).toBe("complete");
   });
 
   it("keeps a completed remotely absent conversation in the import index", async () => {

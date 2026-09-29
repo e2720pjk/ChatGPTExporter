@@ -40,6 +40,48 @@ describe("append-preserving capture store", () => {
     expect(filesystem.paths().filter((path) => path.includes("/detail-"))).toHaveLength(2);
   });
 
+  it("stores shared batch revisions once and rejects corrupted content-addressed files", async () => {
+    const filesystem = new MemoryArchiveFileSystem();
+    const store = new CaptureStore(filesystem, "run-1", "a".repeat(32));
+    const batch = [{ id: "conversation-1" }, { id: "conversation-2" }];
+    const first = await store.writeRawBatchRevision(batch);
+    const repeat = await store.writeRawBatchRevision(batch);
+
+    expect(repeat).toEqual(first);
+    expect(first.path).toBe(`source/batches/batch-${first.hash}.json`);
+    expect(filesystem.paths().filter((path) => path.startsWith("source/batches/"))).toEqual([first.path]);
+    await filesystem.writeTextAtomic(first.path, "corrupted\n");
+    await expect(store.writeRawBatchRevision(batch)).rejects.toThrow("Existing raw revision hash mismatch");
+  });
+
+  it("accepts legacy batch paths but rejects references outside the archive", async () => {
+    const filesystem = new MemoryArchiveFileSystem();
+    const store = new CaptureStore(filesystem, "run-1", "a".repeat(32));
+    const detail = await store.writeRawRevision("conversation-1", "detail", { id: "conversation-1" });
+    const batch = await store.writeRawBatchRevision([{ id: "conversation-1" }]);
+    const legacyBatchPath = `conversations/conversation-1/source/batch-${batch.hash}.json`;
+    await filesystem.writeTextAtomic(legacyBatchPath, (await filesystem.readText(batch.path))!);
+    const marker: RawCompletionMarker = {
+      schemaVersion: 1,
+      provider: "chatgpt-web",
+      logicalKey: conversation.logicalKey,
+      conversationId: conversation.conversationId,
+      workspaceFingerprint: "a".repeat(32),
+      listingHashes: conversation.listingHashes,
+      detailHash: detail.hash,
+      detailPath: detail.path,
+      batchHash: batch.hash,
+      batchPath: legacyBatchPath,
+      retrievalSource: "batch",
+      completedAt: "2026-08-01T00:00:00.000Z",
+    };
+    await store.writeRawMarker(marker);
+    expect(await store.validRawMarker(conversation)).toEqual(marker);
+
+    await store.writeRawMarker({ ...marker, batchPath: "../../outside.json" });
+    expect(await store.validRawMarker(conversation)).toBeUndefined();
+  });
+
   it("resumes only from a marker whose identity, listings, and referenced bytes all validate", async () => {
     const filesystem = new MemoryArchiveFileSystem();
     const store = new CaptureStore(filesystem, "run-1", "a".repeat(32));
