@@ -6,6 +6,9 @@ Authentication stays inside the normal `chatgpt.com` page. The extension never a
 
 This is an independent community project and is not affiliated with or endorsed by OpenAI. ChatGPT's private web endpoints can change; retain raw evidence and review the compatibility notes before relying on a new release.
 
+<img width="765" height="733" alt="2026-10-01 11 29 19" src="https://github.com/user-attachments/assets/e776809a-b93d-419c-8a13-acbf49589b6b" />
+
+
 ## What it preserves
 
 - Every conversation found by normally terminating main, archived, project, and shared inventory chains.
