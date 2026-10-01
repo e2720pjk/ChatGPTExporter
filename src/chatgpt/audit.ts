@@ -5,6 +5,8 @@ import { sha256Hex } from "../core/hash";
 import { conversationBasePath, isBatchRevisionPath, rawDetailRevisionPath } from "../core/paths";
 import { IncrementalSha256 } from "../core/sha256-stream";
 import { parseJson, prettyJson } from "../core/serialization";
+import { currentExportInventory, sameMemberships } from "../core/selection";
+import { writeCurrentAssetIndex } from "./assets";
 import type {
   ArchiveManifest,
   AssetRecord,
@@ -30,6 +32,8 @@ export interface ArchiveAuditReport {
   expectedConversationCount: number;
   completeConversationCount: number;
   extraRetainedConversationCount: number;
+  discoveredConversationCount: number;
+  discoveredProjectCount: number;
   projectCount: number;
   logicalAssetReferenceCount: number;
   physicalAssetCount: number;
@@ -50,10 +54,13 @@ export async function auditArchive(options: {
   now?: () => Date;
 }): Promise<ArchiveAuditReport> {
   const { filesystem } = options;
-  const inventory = parseJson<ConversationInventory>(await filesystem.readText("inventory.json"));
-  if (!inventory || inventory.schemaVersion !== 1 || inventory.provider !== "chatgpt-web" || !inventory.complete) {
+  const inventoryText = await filesystem.readText("inventory.json");
+  const discovery = parseJson<ConversationInventory>(inventoryText);
+  if (!discovery || discovery.schemaVersion !== 1 || discovery.provider !== "chatgpt-web" || !discovery.complete) {
     throw new Error("A complete ChatGPT inventory is required for archive audit.");
   }
+  const inventory = currentExportInventory(discovery);
+  const discoveriesById = new Map(discovery.conversations.map((item) => [item.conversationId, item]));
   const findings: ArchiveAuditFinding[] = [];
   const allPaths = await filesystem.listPaths();
   const completionPaths = allPaths.filter((path) => /^conversations\/[^/]+\/complete\.json$/.test(path));
@@ -100,14 +107,21 @@ export async function auditArchive(options: {
     if (!rawMarker || !isNormalizedConversation(normalized)) {
       findings.push(error("CONVERSATION_DERIVED_INVALID", "Raw completion or normalized conversation JSON is invalid.", base));
     } else {
+      if (normalized.logicalKey !== conversation.logicalKey || normalized.workspaceFingerprint !== inventory.workspaceFingerprint
+        || !sameMemberships(normalized.memberships, conversation.memberships)
+        || !sameSet(marker.listingHashes, conversation.listingHashes)) {
+        findings.push(error("CONVERSATION_INVENTORY_MISMATCH", "Normalized identity/memberships or completion listing hashes do not match the current inventory. Resume capture to rebuild.", normalizedPath));
+      }
       await verifyRawGraph(filesystem, rawMarker, normalized, findings);
       conversationRows.push({
         logicalKey: conversation.logicalKey,
+        workspaceFingerprint: inventory.workspaceFingerprint,
         conversationId: conversation.conversationId,
         title: normalized.title,
         createTime: normalized.createTime,
         updateTime: normalized.updateTime,
-        memberships: normalized.memberships,
+        memberships: conversation.memberships,
+        selectedForCurrentExport: true,
         normalizedPath,
         rawPath: rawMarker.detailPath,
         normalizedHash: marker.normalizedHash,
@@ -123,12 +137,22 @@ export async function auditArchive(options: {
     }
   }
 
-  for (const project of inventory.projects ?? []) {
-    const path = `projects/${project.projectId}/assets.json`;
-    const index = parseJson<ProjectAssetIndex>(await filesystem.readText(path));
-    if (!index || !Array.isArray(index.assets)) {
-      findings.push(error("PROJECT_ASSET_INDEX_MISSING", "Inventoried project has no readable asset index.", path));
+  const projectAssetPaths = new Map(allPaths.filter((path) => /^projects\/[^/]+\/assets\.json$/.test(path)).map((path) => [path.split("/")[1]!, path]));
+  for (const project of inventory.projects ?? []) projectAssetPaths.set(project.projectId, `projects/${project.projectId}/assets.json`);
+  for (const [projectId, path] of projectAssetPaths) {
+    const assetsText = await filesystem.readText(path);
+    const index = parseJson<ProjectAssetIndex>(assetsText);
+    if (!index || index.schemaVersion !== 1 || index.projectId !== projectId || !Array.isArray(index.assets)) {
+      findings.push(error("PROJECT_ASSET_INDEX_MISSING", "Selected or retained project has no readable matching asset index.", path));
       continue;
+    }
+    const markerPath = path.replace(/assets\.json$/, "complete.json");
+    const markerText = await filesystem.readText(markerPath);
+    if (markerText !== undefined) {
+      const marker = parseJson<{ schemaVersion: number; provider: string; projectId: string; assetsHash: string }>(markerText);
+      if (marker?.schemaVersion !== 1 || marker.provider !== "chatgpt-web" || marker.projectId !== projectId) {
+        findings.push(error("PROJECT_COMPLETION_INVALID", "Project completion identity is invalid.", markerPath));
+      } else await verifyTextHash(assetsText, marker.assetsHash, path, findings);
     }
     logicalAssetReferenceCount += index.assets.length;
     partialAssetReferenceCount += index.assets.filter((asset) => asset.status === "failed").length;
@@ -153,23 +177,28 @@ export async function auditArchive(options: {
       await verifyTextHash(assetsText, marker.assetsHash, `${base}/assets.json`, findings);
       const normalized = parseJson<NormalizedConversation>(normalizedText);
       const rawMarker = parseJson<RawCompletionMarker>(rawMarkerText);
-      if (!isNormalizedConversation(normalized) || !rawMarker) {
+      if (!isNormalizedConversation(normalized) || !rawMarker
+        || marker.workspaceFingerprint !== inventory.workspaceFingerprint || normalized.workspaceFingerprint !== inventory.workspaceFingerprint
+        || marker.logicalKey !== `${inventory.workspaceFingerprint}/${marker.conversationId}`) {
         findings.push(error("RETAINED_CONVERSATION_INVALID", "Retained conversation raw or normalized record is invalid.", base));
         continue;
       }
       await verifyRawGraph(filesystem, rawMarker, normalized, findings);
       conversationRows.push({
         logicalKey: marker.logicalKey,
+        workspaceFingerprint: inventory.workspaceFingerprint,
         conversationId: marker.conversationId,
         title: normalized.title,
         createTime: normalized.createTime,
         updateTime: normalized.updateTime,
-        memberships: normalized.memberships,
+        memberships: discoveriesById.get(marker.conversationId)?.memberships ?? normalized.memberships,
+        selectedForCurrentExport: false,
+        excludedByProjectSelection: discoveriesById.has(marker.conversationId),
         normalizedPath,
         rawPath: rawMarker.detailPath,
         normalizedHash: marker.normalizedHash,
         assetStatus: marker.assetStatus,
-        absentFromCurrentInventory: true,
+        absentFromCurrentInventory: !discoveriesById.has(marker.conversationId),
       });
       const assets = parseJson<ConversationAssetIndex>(assetsText);
       if (assets && Array.isArray(assets.assets)) {
@@ -186,6 +215,7 @@ export async function auditArchive(options: {
   conversationRows.sort((left, right) => String(left.logicalKey).localeCompare(String(right.logicalKey)));
   const conversationsIndexText = jsonl(conversationRows);
   await filesystem.writeTextAtomic("indexes/conversations.jsonl", conversationsIndexText);
+  await writeCurrentAssetIndex(filesystem, discovery);
   const assetsIndexText = await filesystem.readText("indexes/assets.jsonl") ?? "";
   const measuredPaths = await filesystem.listPaths();
   const physicalAssetPaths = measuredPaths.filter((path) => path.startsWith("assets/"));
@@ -217,6 +247,8 @@ export async function auditArchive(options: {
     expectedConversationCount: expectedSet.length,
     completeConversationCount: completionSet.length,
     extraRetainedConversationCount: Math.max(0, completionPaths.length - completionSet.length),
+    discoveredConversationCount: discovery.conversations.length,
+    discoveredProjectCount: discovery.projects?.length ?? 0,
     projectCount: inventory.projects?.length ?? 0,
     logicalAssetReferenceCount,
     physicalAssetCount: physicalAssetPaths.length,
@@ -238,12 +270,15 @@ export async function auditArchive(options: {
     provider: "chatgpt-web",
     workspaceFingerprint: inventory.workspaceFingerprint,
     selectedScopes: unique(inventory.chains.map((chain) => chain.scope)),
+    projectSelection: discovery.projectSelection ?? { excludedProjectIds: [] },
     extensionVersion: options.extensionVersion,
     normalizerVersion: conversationRows.length ? String((parseJson<NormalizedConversation>(await filesystem.readText(String(conversationRows[0]!.normalizedPath)))?.normalizerVersion) ?? "unknown") : "unknown",
     createdAt: previousManifest?.createdAt ?? report.auditedAt,
     updatedAt: report.auditedAt,
     runIds: unique((await filesystem.listPaths("runs")).map((path) => path.split("/").at(-1)?.replace(/\.json$/, "") ?? "").filter(Boolean)),
     currentIndexHashes: {
+      inventory: await sha256Hex(inventoryText!),
+      validation: await sha256Hex(prettyJson(report)),
       conversations: report.conversationsIndexHash,
       assets: report.assetsIndexHash,
       inventorySet: report.inventorySetHash,

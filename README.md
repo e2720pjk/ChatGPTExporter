@@ -45,8 +45,8 @@ Open `chrome://extensions`, enable Developer mode, choose **Load unpacked**, and
 
 1. Open a normal signed-in `https://chatgpt.com/` tab.
 2. In the extension dashboard, find the tab and explicitly select the workspaces to archive.
-3. Run preflight, then choose a parent directory. Each workspace receives an isolated `ChatGPTExport-<fingerprint>` directory.
-4. Select inventory scopes, build the inventory, review its aggregate counts and termination evidence, and confirm it.
+3. Run preflight, then choose a parent directory or an existing workspace archive. Review its read-only local snapshot: workspace identity, recorded completeness, saved conversations/projects, and audit freshness. New exports remain isolated in `ChatGPTExport-<fingerprint>` directories.
+4. Select inventory scopes and build inventory. All discovered projects start checked; uncheck unwanted projects before confirming the current selection. Excluded membership wins even when a conversation also appears in main, archived, shared, or another included project. Discovery metadata is preserved, but excluded detail/file capture is not scheduled.
 5. Start or resume capture. You can pause before the next request, resume, cancel safely, or rerun to retry incomplete records.
 6. Require the final state you need: `complete` means conversations and requested assets passed the independent audit; `conversations complete / assets partial` identifies explicit file exceptions; `incomplete` means the archive is not accepted.
 7. Read `reports/validation.md` inside each workspace archive. Use **Revalidate only** to prove local files without contacting ChatGPT.
@@ -57,7 +57,7 @@ Do not run multiple exporters against the same account simultaneously. The defau
 
 Raw listing/detail/batch revisions are append-preserving under `source/`. Normalized JSON, Markdown, indexes, and reports are derived and rebuildable. Completion markers are written last and contain hashes of every required conversation artifact.
 
-The audited directory is directly consumable by the unified Agent Session Archive adapter; it does not need a giant synthesized `conversations.json`:
+The audited directory is directly consumable by the unified Agent Session Archive adapter; it does not need a giant synthesized `conversations.json`. For the current selected archive, consumers must verify the manifest-bound inventory/index/validation hashes and read only conversation index rows with `selectedForCurrentExport: true`. Previously saved unselected data remains on disk and indexed with `false`; raw evidence/CAS blobs are not a selection authority. Legacy inventories without project selection include all discovered projects. See [Architecture](docs/ARCHITECTURE.md) for the selection and legacy contract:
 
 ```sh
 asm web-import /private/ChatGPTExport-WORKSPACE-FINGERPRINT \

@@ -1,10 +1,28 @@
 import type { ArchiveFileSystem } from "../core/filesystem";
-import { extensionFromMediaType, safePathSegment } from "../core/paths";
+import { conversationBasePath, extensionFromMediaType, safePathSegment } from "../core/paths";
+import { parseJson } from "../core/serialization";
+import { currentExportInventory } from "../core/selection";
 import { IncrementalSha256 } from "../core/sha256-stream";
-import type { AssetRecord, ConversationAssetIndex, InventoryConversation, InventoryProject, JsonValue, ProjectAssetIndex, SafeFailure } from "../core/types";
+import type { AssetRecord, ConversationAssetIndex, ConversationInventory, InventoryConversation, InventoryProject, JsonValue, ProjectAssetIndex, SafeFailure } from "../core/types";
 import { decodeBase64, MAX_ASSET_CHUNK_BYTES } from "./asset-session";
 import type { ChatGptTransport, DiscoveredWorkspace } from "./client";
 import type { ChatGptConversationDetail } from "./envelopes";
+
+/** Rebuild only selected references; retained content-addressed blobs are never removed. */
+export async function writeCurrentAssetIndex(filesystem: ArchiveFileSystem, discovery: ConversationInventory): Promise<void> {
+  const inventory = currentExportInventory(discovery);
+  const rows: Array<Record<string, unknown>> = [];
+  for (const conversation of inventory.conversations) {
+    const value = parseJson<{ assets?: Array<Record<string, unknown>> }>(await filesystem.readText(`${conversationBasePath(conversation.conversationId)}/assets.json`));
+    for (const asset of value?.assets ?? []) rows.push({ logicalKey: conversation.logicalKey, conversationId: conversation.conversationId, ...asset, selectedForCurrentExport: true });
+  }
+  for (const project of inventory.projects ?? []) {
+    const value = parseJson<{ assets?: Array<Record<string, unknown>> }>(await filesystem.readText(`projects/${safePathSegment(project.projectId)}/assets.json`));
+    for (const asset of value?.assets ?? []) rows.push({ logicalKey: `${inventory.workspaceFingerprint}/project/${project.projectId}`, projectId: project.projectId, ...asset, selectedForCurrentExport: true });
+  }
+  rows.sort((left, right) => `${left.logicalKey}\0${left.logicalId}`.localeCompare(`${right.logicalKey}\0${right.logicalId}`));
+  await filesystem.writeTextAtomic("indexes/assets.jsonl", rows.map((row) => JSON.stringify(row)).join("\n") + (rows.length ? "\n" : ""));
+}
 
 interface DiscoveredAsset {
   logicalId: string;

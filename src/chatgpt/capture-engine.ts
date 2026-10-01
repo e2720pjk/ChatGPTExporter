@@ -4,12 +4,13 @@ import { sha256Hex } from "../core/hash";
 import { renderConversationMarkdown } from "../core/markdown";
 import { conversationBasePath } from "../core/paths";
 import { parseJson, prettyJson } from "../core/serialization";
+import { currentExportInventory, sameMemberships } from "../core/selection";
 import type { ConversationInventory, InventoryConversation, InventoryProject, JsonValue, ProjectAssetIndex, SafeFailure } from "../core/types";
 import { ChatGptDetailFetcher, type RawBatchCapture, type RetrievedConversationDetail } from "./capture";
 import type { ChatGptTransport, DiscoveredWorkspace } from "./client";
 import { parseConversationDetail } from "./envelopes";
 import { NORMALIZER_VERSION, normalizeConversation } from "./normalize";
-import { ChatGptAssetManager } from "./assets";
+import { ChatGptAssetManager, writeCurrentAssetIndex } from "./assets";
 import { AccountArtifactCapture } from "./account-artifacts";
 
 export interface ConversationCompletionMarker {
@@ -80,7 +81,7 @@ export class ChatGptCaptureEngine {
   }
 
   async run(): Promise<CaptureRunResult> {
-    const inventory = this.requireInventory(parseJson<ConversationInventory>(await this.options.filesystem.readText("inventory.json")));
+    const inventory = currentExportInventory(this.requireInventory(parseJson<ConversationInventory>(await this.options.filesystem.readText("inventory.json"))));
     const store = new CaptureStore(this.options.filesystem, this.options.runId, this.options.workspace.workspaceFingerprint, this.now);
     await store.start();
     const result: CaptureRunResult = {
@@ -177,7 +178,7 @@ export class ChatGptCaptureEngine {
         throw error;
       }
     }
-    await this.writeAssetIndex(inventory);
+    await writeCurrentAssetIndex(this.options.filesystem, inventory);
     if (result.capturedCount + result.rebuiltCount + result.skippedCount + result.failedCount !== result.inventoryCount) {
       throw new Error("Capture result counts do not reconcile with inventory.");
     }
@@ -293,29 +294,17 @@ export class ChatGptCaptureEngine {
       [`${base}/conversation.md`, marker.markdownHash],
       [`${base}/assets.json`, marker.assetsHash],
     ];
+    let normalized: ReturnType<typeof normalizeConversation> | undefined;
     for (const [path, hash] of files) {
       const content = await this.options.filesystem.readText(path);
       if (content === undefined || await sha256Hex(content) !== hash) return false;
+      if (path === `${base}/conversation.json`) normalized = parseJson<ReturnType<typeof normalizeConversation>>(content);
     }
-    return true;
+    return !!normalized && sameMemberships(normalized.memberships, conversation.memberships);
   }
 
   private async writeRunReport(result: CaptureRunResult): Promise<void> {
     await this.options.filesystem.writeTextAtomic(`reports/capture-${this.options.runId}.json`, prettyJson(result));
-  }
-
-  private async writeAssetIndex(inventory: ConversationInventory): Promise<void> {
-    const rows: Array<Record<string, unknown>> = [];
-    for (const conversation of inventory.conversations) {
-      const value = parseJson<{ assets?: Array<Record<string, unknown>> }>(await this.options.filesystem.readText(`${conversationBasePath(conversation.conversationId)}/assets.json`));
-      for (const asset of value?.assets ?? []) rows.push({ logicalKey: conversation.logicalKey, conversationId: conversation.conversationId, ...asset });
-    }
-    for (const project of inventory.projects ?? []) {
-      const value = parseJson<{ assets?: Array<Record<string, unknown>> }>(await this.options.filesystem.readText(`${projectBasePath(project.projectId)}/assets.json`));
-      for (const asset of value?.assets ?? []) rows.push({ logicalKey: `${this.options.workspace.workspaceFingerprint}/project/${project.projectId}`, projectId: project.projectId, ...asset });
-    }
-    rows.sort((left, right) => `${left.logicalKey}\0${left.logicalId}`.localeCompare(`${right.logicalKey}\0${right.logicalId}`));
-    await this.options.filesystem.writeTextAtomic("indexes/assets.jsonl", rows.map((row) => JSON.stringify(row)).join("\n") + (rows.length ? "\n" : ""));
   }
 
   private async captureProjectAssets(projects: InventoryProject[], assetManager: ChatGptAssetManager): Promise<{

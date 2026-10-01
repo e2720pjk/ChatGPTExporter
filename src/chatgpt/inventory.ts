@@ -2,7 +2,8 @@ import type { ArchiveFileSystem } from "../core/filesystem";
 import { hashJson, sha256Hex } from "../core/hash";
 import { isJsonObject } from "../core/json";
 import { safePathSegment } from "../core/paths";
-import { prettyJson } from "../core/serialization";
+import { prettyJson, toJsonValue } from "../core/serialization";
+import { currentExportInventory } from "../core/selection";
 import type {
   ConversationInventory,
   ConversationScope,
@@ -86,36 +87,9 @@ export class ChatGptInventoryEngine {
       conversations: [...this.conversations.values()].sort((left, right) => left.logicalKey.localeCompare(right.logicalKey)),
     };
     if (!inventory.complete) throw new InventoryError("INVENTORY_INCOMPLETE", "Not every inventory chain terminated normally.");
-    if (previous) {
-      const previousText = prettyJson(previous);
-      const previousHash = await sha256Hex(previousText);
-      const previousPath = `source/inventory/snapshots/inventory-${previousHash}.json`;
-      if (!await this.options.filesystem.exists(previousPath)) await this.options.filesystem.writeTextAtomic(previousPath, previousText);
-    }
+    if (previous) await preserveInventorySnapshot(this.options.filesystem, previous);
     await this.options.filesystem.writeTextAtomic("inventory.json", prettyJson(inventory));
-    await this.options.filesystem.writeTextAtomic("reports/reconciliation.json", prettyJson({
-      schemaVersion: 1,
-      provider: "chatgpt-web",
-      workspaceFingerprint: this.options.workspace.workspaceFingerprint,
-      inventoryHash: await hashJson(JSON.parse(JSON.stringify(inventory)) as JsonValue),
-      expectedConversationCount: inventory.conversations.length,
-      absentRetainedConversationCount: inventory.absentConversations?.length ?? 0,
-      pageEvidenceCount: inventory.pages.length,
-      aggregateResponseBytes: this.aggregateBytes,
-      allChainsComplete: inventory.chains.every((item) => item.complete && item.terminationReason !== null),
-      conversationCountsByScope: Object.fromEntries((["main", "archived", "project", "shared"] as const).map((scope) => [
-        scope,
-        inventory.conversations.filter((conversation) => conversation.memberships.some((membership) => membership.scope === scope)).length,
-      ])),
-      chains: inventory.chains.map((item) => ({
-        chainId: item.chainId,
-        scope: item.scope,
-        pageCount: item.pageCount,
-        itemCount: item.itemCount,
-        uniqueConversationCount: item.uniqueConversationCount,
-        terminationReason: item.terminationReason,
-      })),
-    }));
+    await writeReconciliationReport(this.options.filesystem, inventory);
     return inventory;
   }
 
@@ -498,6 +472,72 @@ function parsePreviousInventory(value: string | undefined, workspaceFingerprint:
   } catch {
     return undefined;
   }
+}
+
+/** Preserve the complete previous inventory, including any selection, before replacement. */
+async function preserveInventorySnapshot(filesystem: ArchiveFileSystem, inventory: ConversationInventory): Promise<void> {
+  const text = prettyJson(inventory);
+  const path = `source/inventory/snapshots/inventory-${await sha256Hex(text)}.json`;
+  if (!await filesystem.exists(path)) await filesystem.writeTextAtomic(path, text);
+}
+
+/** Rebuild this derived report from inventory, never from potentially missing/stale report fields. */
+async function writeReconciliationReport(filesystem: ArchiveFileSystem, inventory: ConversationInventory): Promise<void> {
+  const selected = currentExportInventory(inventory);
+  await filesystem.writeTextAtomic("reports/reconciliation.json", prettyJson({
+    schemaVersion: 1,
+    provider: "chatgpt-web",
+    workspaceFingerprint: inventory.workspaceFingerprint,
+    inventoryHash: await hashJson(toJsonValue(inventory)),
+    // Legacy discovery totals retain their meaning; selected counts describe the current export.
+    expectedConversationCount: inventory.conversations.length,
+    selectedConversationCount: selected.conversations.length,
+    selectedProjectCount: selected.projects?.length ?? 0,
+    absentRetainedConversationCount: inventory.absentConversations?.length ?? 0,
+    pageEvidenceCount: inventory.pages.length,
+    aggregateResponseBytes: inventory.pages.reduce((sum, page) => sum + page.responseBytes, 0),
+    allChainsComplete: inventory.chains.every((item) => item.complete && item.terminationReason !== null),
+    conversationCountsByScope: Object.fromEntries((["main", "archived", "project", "shared"] as const).map((scope) => [
+      scope,
+      inventory.conversations.filter((conversation) => conversation.memberships.some((membership) => membership.scope === scope)).length,
+    ])),
+    chains: inventory.chains.map((item) => ({
+      chainId: item.chainId,
+      scope: item.scope,
+      pageCount: item.pageCount,
+      itemCount: item.itemCount,
+      uniqueConversationCount: item.uniqueConversationCount,
+      terminationReason: item.terminationReason,
+    })),
+  }));
+}
+
+/** Commit selection only after discovery; keep prior inventory evidence append-preserving. */
+export async function saveProjectSelection(
+  filesystem: ArchiveFileSystem,
+  inventory: ConversationInventory,
+  excludedProjectIds: string[],
+): Promise<ConversationInventory> {
+  const discovered = new Set((inventory.projects ?? []).map((project) => project.projectId));
+  if (excludedProjectIds.some((id) => !discovered.has(id))) throw new Error("Project selection contains an undiscovered project.");
+  const previous = await filesystem.readText("inventory.json");
+  if (!previous) throw new Error("Inventory is missing. Rebuild inventory before confirming selection.");
+  const previousInventory = JSON.parse(previous) as ConversationInventory;
+  const { projectSelection: _savedSelection, ...savedDiscovery } = previousInventory;
+  const { projectSelection: _pendingSelection, ...expectedDiscovery } = inventory;
+  if (await hashJson(savedDiscovery as unknown as JsonValue) !== await hashJson(expectedDiscovery as unknown as JsonValue)) {
+    throw new Error("Inventory changed. Rebuild inventory before confirming selection.");
+  }
+  const updated: ConversationInventory = {
+    ...inventory,
+    projectSelection: { excludedProjectIds: [...new Set(excludedProjectIds)].sort() },
+  };
+  // Validate before changing the current inventory; the derived report is published afterwards.
+  currentExportInventory(updated);
+  await preserveInventorySnapshot(filesystem, previousInventory);
+  await filesystem.writeTextAtomic("inventory.json", prettyJson(updated));
+  await writeReconciliationReport(filesystem, updated);
+  return updated;
 }
 
 function retainedAbsent(previous: ConversationInventory | undefined, current: Map<string, InventoryConversation>): InventoryConversation[] {

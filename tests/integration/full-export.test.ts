@@ -4,9 +4,12 @@ import { auditArchive } from "../../src/chatgpt/audit";
 import { ChatGptCaptureEngine } from "../../src/chatgpt/capture-engine";
 import type { ChatGptTransport, DiscoveredWorkspace } from "../../src/chatgpt/client";
 import type { ChatGptOperationParameters } from "../../src/chatgpt/endpoints";
-import { ChatGptInventoryEngine, DEFAULT_INVENTORY_SETTINGS, runWorkspaceInventories } from "../../src/chatgpt/inventory";
+import { ChatGptInventoryEngine, DEFAULT_INVENTORY_SETTINGS, runWorkspaceInventories, saveProjectSelection } from "../../src/chatgpt/inventory";
 import { MemoryArchiveFileSystem } from "../../src/core/filesystem";
 import { sha256Hex } from "../../src/core/hash";
+import { prettyJson } from "../../src/core/serialization";
+import { currentExportInventory } from "../../src/core/selection";
+import { readArchiveFolderStatus } from "../../src/chatgpt/archive-status";
 import type { JsonValue } from "../../src/core/types";
 import { BRIDGE_PROTOCOL_VERSION, type ApiSuccessResponse } from "../../src/extension/protocol";
 import { conversationDetail } from "../fixtures/chatgpt";
@@ -110,9 +113,142 @@ describe("deterministic full-scope export integration", () => {
     expect(emptyCapture).toMatchObject({ inventoryCount: 0, capturedCount: 0, failedCount: 0 });
     expect((await auditArchive({ filesystem: second, extensionVersion: "0.0.0-test" })).terminalState).toBe("complete");
   });
+
+  it("excludes project membership even across main/archived/shared and another selected project before capture", async () => {
+    const filesystem = new MemoryArchiveFileSystem();
+    const discovery = await new ChatGptInventoryEngine({ transport: fullTransport(true), filesystem, workspace, settings: DEFAULT_INVENTORY_SETTINGS }).run();
+    expect(discovery.projects).toHaveLength(2);
+    await saveProjectSelection(filesystem, discovery, ["project-2"]);
+    const transport = fullTransport(true);
+    expect(await new ChatGptCaptureEngine({ transport, filesystem, workspace, runId: "selected", includeAccountArtifacts: false }).run())
+      .toMatchObject({ inventoryCount: 4, capturedCount: 4, failedCount: 0, projectAssetCount: 0 });
+    const batches = transport.request.mock.calls.filter(([operation]) => operation.operation === "conversation_batch");
+    expect(batches.flatMap(([operation]) => operation.parameters.conversationIds!)).toEqual(["conversation-3", "conversation-4", "project-only"]);
+    expect(transport.request.mock.calls.filter(([operation]) => operation.operation === "asset_open" || operation.operation === "conversation_detail")).toHaveLength(0);
+    for (const id of ["conversation-1", "conversation-2"]) expect(await filesystem.exists(`conversations/${id}/complete.json`)).toBe(false);
+    expect(await filesystem.exists("projects/project-2/assets.json")).toBe(false);
+    expect(await auditArchive({ filesystem, extensionVersion: "test" })).toMatchObject({
+      terminalState: "complete", expectedConversationCount: 4, projectCount: 1, discoveredConversationCount: 6, discoveredProjectCount: 2,
+    });
+    expect(await filesystem.listPaths("source/batches")).toHaveLength(1);
+  });
+
+  it("retains excluded existing bytes and publishes generic current-selection indexes; reselect reuses completion markers", async () => {
+    const filesystem = new MemoryArchiveFileSystem();
+    const discovery = await new ChatGptInventoryEngine({ transport: fullTransport(), filesystem, workspace, settings: DEFAULT_INVENTORY_SETTINGS }).run();
+    await new ChatGptCaptureEngine({ transport: fullTransport(), filesystem, workspace, runId: "all" }).run();
+    await auditArchive({ filesystem, extensionVersion: "test" });
+    const legacySnapshot = prettyJson(discovery);
+    const legacySnapshotPath = `indexes/inventory-snapshots/${await sha256Hex(legacySnapshot)}.json`;
+    await filesystem.writeTextAtomic(legacySnapshotPath, legacySnapshot);
+    const preservedPaths = (await filesystem.listPaths()).filter((path) => ["conversations/", "projects/", "assets/", "source/", "indexes/inventory-snapshots/"].some((prefix) => path.startsWith(prefix)));
+    const preserved = new Map(await Promise.all(preservedPaths.map(async (path) => [path, await sha256Hex((await filesystem.readBytes(path))!)] as const)));
+    const selected = await saveProjectSelection(filesystem, discovery, ["project-1", "project-2"]);
+    const transport = fullTransport();
+    expect(await new ChatGptCaptureEngine({ transport, filesystem, workspace, runId: "exclude" }).run())
+      .toMatchObject({ inventoryCount: 4, skippedCount: 4, capturedCount: 0, rebuiltCount: 0 });
+    expect(transport.request).not.toHaveBeenCalled();
+    expect(await auditArchive({ filesystem, extensionVersion: "test" })).toMatchObject({
+      terminalState: "complete", expectedConversationCount: 4, extraRetainedConversationCount: 2, projectCount: 0,
+    });
+    const rows = (await filesystem.readText("indexes/conversations.jsonl"))!.trim().split("\n").map((line) => JSON.parse(line));
+    expect(rows.filter((row) => row.selectedForCurrentExport)).toHaveLength(4);
+    expect(rows.find((row) => row.conversationId === "conversation-1")).toMatchObject({
+      selectedForCurrentExport: false, excludedByProjectSelection: true, absentFromCurrentInventory: false,
+    });
+    const assetRows = (await filesystem.readText("indexes/assets.jsonl"))!.trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
+    expect(assetRows.every((row) => row.selectedForCurrentExport && row.projectId === undefined && row.conversationId !== "conversation-1")).toBe(true);
+    for (const [path, hash] of preserved) expect(await sha256Hex((await filesystem.readBytes(path))!)).toBe(hash);
+    const status = await readArchiveFolderStatus(filesystem);
+    expect(status).toMatchObject({ kind: "archive", auditMatchesInventory: true });
+    expect(status.projects.find((project) => project.projectId === "project-2")).toMatchObject({ selectedForCurrentExport: false, savedFileCount: 1, fileStatus: "complete" });
+    await saveProjectSelection(filesystem, selected, []);
+    const rerun = fullTransport();
+    expect(await new ChatGptCaptureEngine({ transport: rerun, filesystem, workspace, runId: "reselect" }).run()).toMatchObject({ inventoryCount: 6, skippedCount: 6 });
+    expect(rerun.request).not.toHaveBeenCalled();
+    expect(await auditArchive({ filesystem, extensionVersion: "test" })).toMatchObject({ terminalState: "complete", extraRetainedConversationCount: 0 });
+    expect(await filesystem.readText(legacySnapshotPath)).toBe(legacySnapshot);
+  });
+
+  it("isolates selection between workspaces with identical provider project IDs", async () => {
+    const first = new MemoryArchiveFileSystem();
+    const second = new MemoryArchiveFileSystem();
+    const other = { ...workspace, accountId: "account-other", workspaceFingerprint: "c".repeat(32) };
+    const inventories = await runWorkspaceInventories({ transport: fullTransport(), settings: DEFAULT_INVENTORY_SETTINGS, targets: [{ workspace, filesystem: first }, { workspace: other, filesystem: second }] });
+    await saveProjectSelection(first, inventories.get(workspace.workspaceFingerprint)!, ["project-1"]);
+    await saveProjectSelection(second, inventories.get(other.workspaceFingerprint)!, ["project-2"]);
+    expect(await new ChatGptCaptureEngine({ transport: fullTransport(), filesystem: first, workspace, runId: "first" }).run()).toMatchObject({ inventoryCount: 4, projectAssetCount: 1 });
+    expect(await new ChatGptCaptureEngine({ transport: fullTransport(), filesystem: second, workspace: other, runId: "second" }).run()).toMatchObject({ inventoryCount: 6, projectAssetCount: 0 });
+    expect(await first.exists("conversations/conversation-1/complete.json")).toBe(false);
+    expect(await second.exists("conversations/conversation-1/complete.json")).toBe(true);
+    expect(await first.exists("projects/project-2/complete.json")).toBe(true);
+    expect(await second.exists("projects/project-2/complete.json")).toBe(false);
+    for (const filesystem of [first, second]) expect((await auditArchive({ filesystem, extensionVersion: "test" })).terminalState).toBe("complete");
+  });
+
+  it("rebuilds membership-only changes from valid raw instead of accepting stale normalized memberships", async () => {
+    const filesystem = new MemoryArchiveFileSystem();
+    const discovery = await new ChatGptInventoryEngine({ transport: fullTransport(), filesystem, workspace, settings: DEFAULT_INVENTORY_SETTINGS }).run();
+    await new ChatGptCaptureEngine({ transport: fullTransport(), filesystem, workspace, runId: "all" }).run();
+    discovery.conversations.find((conversation) => conversation.conversationId === "conversation-2")!.memberships.push({ scope: "project", projectId: "project-1", projectName: "One" });
+    await filesystem.writeTextAtomic("inventory.json", prettyJson(discovery));
+    expect((await auditArchive({ filesystem, extensionVersion: "test" })).findings.some((finding) => finding.code === "CONVERSATION_INVENTORY_MISMATCH")).toBe(true);
+    const transport = fullTransport();
+    expect(await new ChatGptCaptureEngine({ transport, filesystem, workspace, runId: "membership-rebuild" }).run()).toMatchObject({ rebuiltCount: 1, skippedCount: 5, capturedCount: 0 });
+    expect(transport.request).not.toHaveBeenCalled();
+    expect((await auditArchive({ filesystem, extensionVersion: "test" })).terminalState).toBe("complete");
+    const selected = await saveProjectSelection(filesystem, discovery, ["project-1"]);
+    expect(currentExportInventory(selected).conversations.map((item) => item.conversationId)).not.toContain("conversation-2");
+  });
+
+  it("resumes interrupted selected capture without fetching excluded IDs or duplicating shared batch CAS", async () => {
+    const filesystem = new MemoryArchiveFileSystem();
+    const discovery = await new ChatGptInventoryEngine({ transport: fullTransport(), filesystem, workspace, settings: DEFAULT_INVENTORY_SETTINGS }).run();
+    await saveProjectSelection(filesystem, discovery, ["project-1", "project-2"]);
+    const write = filesystem.writeTextAtomic.bind(filesystem);
+    let interrupted = false;
+    const spy = vi.spyOn(filesystem, "writeTextAtomic").mockImplementation(async (path, content) => {
+      if (!interrupted && path === "conversations/share_share-only/conversation.md") { interrupted = true; throw new Error("Interrupted derived write"); }
+      await write(path, content);
+    });
+    const initial = fullTransport();
+    await expect(new ChatGptCaptureEngine({ transport: initial, filesystem, workspace, runId: "interrupted", includeAccountArtifacts: false }).run()).rejects.toThrow("Interrupted derived write");
+    spy.mockRestore();
+    const batches = initial.request.mock.calls.filter(([operation]) => operation.operation === "conversation_batch");
+    expect(batches.flatMap(([operation]) => operation.parameters.conversationIds!)).not.toContain("conversation-1");
+    expect(batches.flatMap(([operation]) => operation.parameters.conversationIds!)).not.toContain("project-only");
+    const resume = fullTransport();
+    expect(await new ChatGptCaptureEngine({ transport: resume, filesystem, workspace, runId: "resume", includeAccountArtifacts: false }).run()).toMatchObject({ inventoryCount: 4, rebuiltCount: 1, skippedCount: 3, failedCount: 0 });
+    expect(resume.request).not.toHaveBeenCalled();
+    expect(await filesystem.listPaths("source/batches")).toHaveLength(1);
+    expect((await auditArchive({ filesystem, extensionVersion: "test" })).terminalState).toBe("complete");
+  });
+
+  it("fails closed on malformed selection and rejects unknown projects / stale discovery on confirm", async () => {
+    const filesystem = new MemoryArchiveFileSystem();
+    const discovery = await new ChatGptInventoryEngine({ transport: fullTransport(), filesystem, workspace, settings: DEFAULT_INVENTORY_SETTINGS }).run();
+    await expect(saveProjectSelection(filesystem, discovery, ["unknown-project"])).rejects.toThrow("undiscovered");
+    await filesystem.writeTextAtomic("inventory.json", prettyJson({ ...discovery, generatedAt: "changed" }));
+    await expect(saveProjectSelection(filesystem, discovery, [])).rejects.toThrow("Inventory changed");
+    await filesystem.writeTextAtomic("inventory.json", prettyJson({ ...discovery, projectSelection: { excludedProjectIds: "invalid" } }));
+    const transport = fullTransport();
+    await expect(new ChatGptCaptureEngine({ transport, filesystem, workspace, runId: "invalid" }).run()).rejects.toThrow("Invalid project selection");
+    expect(transport.request).not.toHaveBeenCalled();
+  });
+  it("still audits damaged retained project assets after that project is excluded", async () => {
+    const filesystem = new MemoryArchiveFileSystem();
+    const discovery = await new ChatGptInventoryEngine({ transport: fullTransport(), filesystem, workspace, settings: DEFAULT_INVENTORY_SETTINGS }).run();
+    await new ChatGptCaptureEngine({ transport: fullTransport(), filesystem, workspace, runId: "all" }).run();
+    await saveProjectSelection(filesystem, discovery, ["project-2"]);
+    const assets = JSON.parse((await filesystem.readText("projects/project-2/assets.json"))!);
+    await filesystem.writeTextAtomic(assets.assets[0].relativePath.replace(/^\.\.\/\.\.\//, ""), "damaged retained project asset");
+    const report = await auditArchive({ filesystem, extensionVersion: "test" });
+    expect(report.terminalState).toBe("conversations_complete_assets_partial");
+    expect(report.findings.some((finding) => finding.code === "ASSET_HASH_MISMATCH")).toBe(true);
+  });
 });
 
-function fullTransport(): ChatGptTransport & { request: ReturnType<typeof vi.fn> } {
+function fullTransport(overlap = false): ChatGptTransport & { request: ReturnType<typeof vi.fn> } {
   const projectBytes = new TextEncoder().encode("project-level file");
   const handles = new Set<string>();
   const request = vi.fn(async (operation: ChatGptOperationParameters): Promise<ApiSuccessResponse> => {
@@ -130,7 +266,7 @@ function fullTransport(): ChatGptTransport & { request: ReturnType<typeof vi.fn>
     } else if (operation.operation === "project_conversation_page") {
       body = operation.parameters.projectId === "project-1"
         ? { items: [listing("conversation-1"), listing("project-only")], cursor: null }
-        : { items: [], cursor: null };
+        : { items: overlap ? [listing("conversation-1"), listing("conversation-2")] : [], cursor: null };
     } else if (operation.operation === "shared_page") {
       body = { items: [{ id: "share-owned", conversation_id: "conversation-1", title: "Owned" }, { id: "share-only", title: "Share only" }], total: 2 };
     } else if (operation.operation === "conversation_batch") {

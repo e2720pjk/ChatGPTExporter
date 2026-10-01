@@ -77,6 +77,11 @@ export interface InventoryChain {
   uniqueConversationCount: number;
 }
 
+/** Workspace-local selection; omitted in legacy inventories means all discovered projects. */
+export interface ProjectSelection {
+  excludedProjectIds: string[];
+}
+
 export interface ConversationInventory {
   schemaVersion: 1;
   provider: "chatgpt-web";
@@ -86,6 +91,7 @@ export interface ConversationInventory {
   chains: InventoryChain[];
   pages: InventoryPageRecord[];
   projects?: InventoryProject[];
+  projectSelection?: ProjectSelection;
   absentConversations?: InventoryConversation[];
   conversations: InventoryConversation[];
 }
@@ -249,6 +255,8 @@ export interface ArchiveManifest {
   provider: "chatgpt-web";
   workspaceFingerprint: string;
   selectedScopes: ConversationScope[];
+  /** Mirrors inventory.json; the hashed inventory remains the selection authority. */
+  projectSelection?: ProjectSelection;
   extensionVersion: string;
   normalizerVersion: string;
   createdAt: string;

@@ -49,7 +49,7 @@
           <h2>3. Choose archive directory</h2>
           <p id="directory-label">Verify selected workspaces first</p>
         </div>
-        <button id="choose-directory" type="button" disabled>Choose parent directory</button>
+        <button id="choose-directory" type="button" disabled>Choose output directory</button>
       </section>
 
       <section class="panel inventory-panel">
@@ -69,12 +69,20 @@
         <button id="run-inventory" type="button" disabled>Build inventory</button>
       </section>
 
-      <section class="panel confirmation-panel">
-        <div>
-          <h2>5. Confirm inventory</h2>
-          <p id="inventory-summary">Build an inventory first. Capture stays locked until you confirm its aggregate counts and scope termination.</p>
+      <section class="panel project-selection-panel" aria-labelledby="project-selection-heading">
+        <h2 id="project-selection-heading">5. Choose projects for this export</h2>
+        <p>All discovered projects are included by default. Uncheck a project to skip its conversations and files, even when a conversation also appears in another scope. Discovery metadata remains as raw evidence; existing saved data is never deleted.</p>
+        <div id="project-selection"><p>Build inventory to discover projects.</p></div>
+        <div class="selection-confirmation">
+          <p id="inventory-summary" aria-live="polite">Build an inventory first. Capture stays locked until you confirm the current selection.</p>
+          <button id="confirm-inventory" type="button" disabled>Confirm current selection</button>
         </div>
-        <button id="confirm-inventory" type="button" disabled>Confirm inventory</button>
+      </section>
+
+      <section class="panel archive-summary-panel" aria-labelledby="archive-summary-heading">
+        <h2 id="archive-summary-heading">Existing archive · local snapshot</h2>
+        <p>You may choose a workspace archive itself or its parent directory. Previously saved data and this run’s capture selection are separate.</p>
+        <div id="archive-summary"><p>Choose an output directory to inspect its existing archives.</p></div>
       </section>
 
       <section class="panel capture-panel">

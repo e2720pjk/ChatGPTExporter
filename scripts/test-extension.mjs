@@ -15,6 +15,7 @@ const certificatePath = path.join(temporaryRoot, "certificate.pem");
 const keyPath = path.join(temporaryRoot, "key.pem");
 let conversationListingRequests = 0;
 let batchRequests = 0;
+const batchConversationIds = [];
 execFileSync("openssl", [
   "req", "-x509", "-newkey", "rsa:2048", "-nodes",
   "-keyout", keyPath,
@@ -91,11 +92,27 @@ const server = https.createServer({
     request.on("data", (chunk) => { body += chunk; });
     request.on("end", () => {
       const ids = JSON.parse(body).conversation_ids;
+      batchConversationIds.push(...ids);
       setTimeout(() => {
         response.writeHead(200, { "Content-Type": "application/json" });
         response.end(JSON.stringify(ids.map(syntheticConversation)));
       }, 75);
     });
+    return;
+  }
+  if (requestUrl.pathname === "/backend-api/gizmos/snorlax/sidebar") {
+    response.writeHead(200, { "Content-Type": "application/json" });
+    response.end(JSON.stringify({ items: [
+      { gizmo: { gizmo: { id: "project-1", display: { name: "Synthetic project One" } }, files: [] } },
+      { gizmo: { gizmo: { id: "project-2", display: { name: "Synthetic project Two" } }, files: [] } },
+    ], cursor: null }));
+    return;
+  }
+  const projectMatch = /^\/backend-api\/gizmos\/(project-[12])\/conversations$/.exec(requestUrl.pathname);
+  if (projectMatch) {
+    const id = projectMatch[1] === "project-1" ? "conversation-1" : "conversation-2";
+    response.writeHead(200, { "Content-Type": "application/json" });
+    response.end(JSON.stringify({ items: [{ id, title: `Synthetic ${id === "conversation-1" ? "one" : "two"}`, create_time: id.endsWith("1") ? 1 : 3, update_time: id.endsWith("1") ? 2 : 4 }], cursor: null }));
     return;
   }
   if (requestUrl.pathname === "/backend-api/accounts/check/v4-2023-04-27") {
@@ -342,7 +359,89 @@ try {
   await dashboard.locator('#status[data-state="complete"]').waitFor();
   const secondTreeHash = await dashboard.evaluate(hashAuthoritativeArchiveTree);
   assert(secondTreeHash.hash === firstTreeHash.hash, "Revalidate-only changed authoritative conversation/archive bytes.");
-  console.log(`Chromium packaged dashboard, pause/resume, directory, and archive-tree test passed (${firstTreeHash.hash.slice(0, 12)}).`);
+  // Choose the existing workspace archive itself; never create a nested export.
+  await dashboard.evaluate(() => {
+    Object.defineProperty(window, "showDirectoryPicker", {
+      configurable: true, value: async () => {
+        const root = await navigator.storage.getDirectory();
+        for await (const [name, handle] of root.entries()) if (handle.kind === "directory" && name.startsWith("ChatGPTExport-")) return handle;
+        throw new Error("Fixture archive was not created");
+      },
+    });
+  });
+  await dashboard.locator("#choose-directory").click();
+  await dashboard.locator("#archive-summary").getByText(/Previously indexed: 2 saved conversations/).waitFor();
+  const originalExcluded = await dashboard.evaluate(async () => {
+    const root = await window.showDirectoryPicker();
+    const conversations = await root.getDirectoryHandle("conversations");
+    return (await (await (await conversations.getDirectoryHandle("conversation-1")).getFileHandle("conversation.json")).getFile()).text();
+  });
+  await dashboard.locator("#scope-projects").check();
+  const beforeProjectDiscovery = batchRequests;
+  await dashboard.locator("#run-inventory").click();
+  await dashboard.locator("#confirm-inventory:not([disabled])").waitFor();
+  const projects = dashboard.locator("#project-selection input[type=checkbox]");
+  assert(await projects.count() === 2 && await projects.nth(0).isChecked() && await projects.nth(1).isChecked(), "Discovered projects are not individually checked by default.");
+  assert(batchRequests === beforeProjectDiscovery, "Project discovery downloaded conversation details.");
+  await projects.nth(0).uncheck();
+  assert((await dashboard.locator("#inventory-summary").textContent())?.includes("This run: 1 conversations and 1 projects selected"), "Unchecking a project did not update the selected conversation union.");
+  assert((await dashboard.locator("#archive-summary").textContent())?.includes("1 previously saved conversations are outside this run"), "Local saved data and pending selection are not distinguished.");
+  await dashboard.locator("#confirm-inventory").click();
+  await dashboard.locator("#run-capture:not([disabled])").click();
+  await dashboard.locator('#status[data-state="complete"]').waitFor();
+  await dashboard.locator("#choose-directory:not([disabled])").waitFor();
+  const selectedArchive = await dashboard.evaluate(async () => {
+    const root = await window.showDirectoryPicker();
+    const inventory = JSON.parse(await (await (await root.getFileHandle("inventory.json")).getFile()).text());
+    const indexes = await root.getDirectoryHandle("indexes");
+    const rows = (await (await (await indexes.getFileHandle("conversations.jsonl")).getFile()).text()).trim().split("\n").map((line) => JSON.parse(line));
+    const reports = await root.getDirectoryHandle("reports");
+    const reconciliation = JSON.parse(await (await (await reports.getFileHandle("reconciliation.json")).getFile()).text());
+    let indexReconciliationExists = false;
+    let indexSnapshotsExist = false;
+    try { await indexes.getFileHandle("reconciliation.json"); indexReconciliationExists = true; } catch (error) { if (error.name !== "NotFoundError") throw error; }
+    try { await indexes.getDirectoryHandle("inventory-snapshots"); indexSnapshotsExist = true; } catch (error) { if (error.name !== "NotFoundError") throw error; }
+    const source = await root.getDirectoryHandle("source");
+    const sourceInventory = await source.getDirectoryHandle("inventory");
+    const snapshots = await sourceInventory.getDirectoryHandle("snapshots");
+    const snapshotNames = [];
+    for await (const [name, handle] of snapshots.entries()) if (handle.kind === "file") snapshotNames.push(name);
+    const conversations = await root.getDirectoryHandle("conversations");
+    const excluded = await conversations.getDirectoryHandle("conversation-1");
+    const excludedBody = await (await (await excluded.getFileHandle("conversation.json")).getFile()).text();
+    const childNames = [];
+    for await (const [name, handle] of root.entries()) if (handle.kind === "directory") childNames.push(name);
+    return { inventory, rows, excludedBody, childNames, reconciliation, indexReconciliationExists, indexSnapshotsExist, snapshotNames };
+  });
+  assert(selectedArchive.inventory.projectSelection.excludedProjectIds.join(",") === "project-1", "UI selection was not committed to inventory authority.");
+  assert(selectedArchive.reconciliation.expectedConversationCount === 2 && selectedArchive.reconciliation.selectedConversationCount === 1 && selectedArchive.reconciliation.selectedProjectCount === 1, "Canonical reconciliation did not distinguish discovery from selected counts.");
+  assert(!selectedArchive.indexReconciliationExists && !selectedArchive.indexSnapshotsExist, "Confirmation created competing index artifacts.");
+  assert(selectedArchive.snapshotNames.length > 0 && selectedArchive.snapshotNames.every((name) => /^inventory-[a-f0-9]{64}[.]json$/.test(name)), "Confirmation did not preserve canonical source inventory snapshots.");
+  assert(selectedArchive.rows.find((row) => row.conversationId === "conversation-1")?.selectedForCurrentExport === false, "Overlapping main/archived project conversation bypassed selection.");
+  assert(selectedArchive.rows.find((row) => row.conversationId === "conversation-2")?.selectedForCurrentExport === true, "Selected project conversation disappeared.");
+  assert(selectedArchive.excludedBody === originalExcluded, "Deselection changed previously saved excluded bytes.");
+  assert(selectedArchive.childNames.every((name) => !name.startsWith("ChatGPTExport-")), "Direct archive selection created a nested archive.");
+  assert(batchRequests === beforeProjectDiscovery, "Existing selected data should rebuild membership from valid raw without downloading again.");
+
+  if (process.env.CHATGPT_EXPORTER_SCREENSHOTS) {
+    await dashboard.setViewportSize({ width: 1120, height: 900 });
+    await dashboard.screenshot({ path: path.join(process.env.CHATGPT_EXPORTER_SCREENSHOTS, "project-selection-desktop.png"), fullPage: true });
+    await dashboard.setViewportSize({ width: 390, height: 844 });
+    assert(await dashboard.evaluate(() => document.documentElement.scrollWidth <= innerWidth), "Narrow viewport overflows horizontally.");
+    await dashboard.screenshot({ path: path.join(process.env.CHATGPT_EXPORTER_SCREENSHOTS, "project-selection-mobile.png"), fullPage: true });
+    await dashboard.setViewportSize({ width: 1120, height: 900 });
+  }
+  await projects.nth(0).check();
+  await dashboard.locator("#confirm-inventory").click();
+  await dashboard.locator("#run-capture:not([disabled])").click();
+  await dashboard.locator('#status[data-state="complete"]').waitFor();
+  await dashboard.locator("#run-capture:not([disabled])").waitFor();
+  await dashboard.locator("#run-capture").click();
+  await dashboard.locator('#status[data-state="complete"]').waitFor();
+  await dashboard.locator("#run-capture:not([disabled])").waitFor();
+  assert((await dashboard.locator("#status").textContent())?.includes("2 unchanged"), "Unchanged selected rerun failed to reuse completion markers.");
+  assert(batchConversationIds.length === 2, "Selection/resume unexpectedly requested additional conversation bodies.");
+  console.log(`Chromium packaged dashboard, pause/resume, project selection, existing/direct directory, retained data, and unchanged rerun passed (${firstTreeHash.hash.slice(0, 12)}).`);
 } finally {
   await context?.close();
   await new Promise((resolve) => server.close(resolve));
